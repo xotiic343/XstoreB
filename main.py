@@ -7,9 +7,14 @@ import logging
 import secrets
 import string
 import uuid
+import random
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from enum import Enum
+import threading
+import time
+from collections import deque
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks, WebSocket, WebSocketDisconnect, Query, Form, UploadFile, File
@@ -21,9 +26,12 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from supabase import create_client, Client
 from dotenv import load_dotenv
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+# SendGrid imports
+import sendgrid
+from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, Personalization
+from sendgrid.helpers.mail import Mail as SendGridMail
+import base64
 
 load_dotenv()
 
@@ -35,10 +43,15 @@ class Settings:
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
     SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
     
+    # SendGrid
+    SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+    SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "noreply@xstore.com")
+    SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "XStore Marketplace")
+    
     # Discord OAuth
     DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
     DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-    DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
+    DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "http://localhost:8000/api/auth/discord/callback")
     
     # Payment Gateways
     PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
@@ -48,17 +61,11 @@ class Settings:
     # CashApp
     CASHAPP_CASHTAG = os.getenv("CASHAPP_CASHTAG", "$XStore")
     
-    # Email
-    SMTP_USER = os.getenv("SMTP_USER")
-    SMTP_PASS = os.getenv("SMTP_PASS")
-    SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-    
     # Roblox
     ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")
     
     # Frontend
-    FRONTEND_URL = os.getenv("FRONTEND_URL")
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
     
     # Exchange Rates
     ROBUX_TO_XCOIN_RATE = int(os.getenv("ROBUX_TO_XCOIN_RATE", 10))
@@ -70,18 +77,29 @@ class Settings:
     AFFILIATE_COOKIE_DAYS = int(os.getenv("AFFILIATE_COOKIE_DAYS", 30))
     
     # Admin
-    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
-    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@xstore.com")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
     
     # Security
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here-change-in-production")
-    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))  # 7 days
+    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))
     
     # Supported Languages
     SUPPORTED_LANGUAGES = ["en", "es", "fr", "de", "ja", "zh", "ru", "pt", "ar", "hi"]
     DEFAULT_LANGUAGE = "en"
+    
+    # Welcome Bonus
+    WELCOME_BONUS_XCOIN = int(os.getenv("WELCOME_BONUS_XCOIN", 100))
 
 settings = Settings()
+
+# ==================== LOGGING ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ==================== SUPABASE CLIENT ====================
 
@@ -141,6 +159,677 @@ async def require_owner(user = Depends(require_user)):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
+# ==================== SENDGRID EMAIL SERVICE ====================
+
+class SendGridEmailService:
+    """Professional email service using SendGrid"""
+    
+    def __init__(self, api_key: str, from_email: str, from_name: str):
+        self.client = sendgrid.SendGridAPIClient(api_key=api_key)
+        self.from_email = from_email
+        self.from_name = from_name
+        self.sent_count = 0
+        self.failed_count = 0
+        
+    def send_email(self, to_email: str, to_name: str, subject: str, html_content: str, 
+                   plain_text: str = None, attachments: List[Dict] = None) -> bool:
+        """Send a single email via SendGrid"""
+        try:
+            message = Mail(
+                from_email=Email(self.from_email, self.from_name),
+                to_emails=To(to_email, to_name),
+                subject=subject,
+                html_content=html_content
+            )
+            
+            if plain_text:
+                message.plain_text_content = plain_text
+            
+            if attachments:
+                for attachment in attachments:
+                    encoded = base64.b64encode(attachment['content'].encode()).decode()
+                    message.attachment = Attachment(
+                        file_content=encoded,
+                        file_name=attachment['filename'],
+                        file_type=attachment.get('type', 'application/octet-stream'),
+                        disposition='attachment'
+                    )
+            
+            response = self.client.send(message)
+            
+            if response.status_code in [202, 200]:
+                self.sent_count += 1
+                logger.info(f"Email sent to {to_email}: {subject}")
+                return True
+            else:
+                self.failed_count += 1
+                logger.error(f"SendGrid error {response.status_code}: {response.body}")
+                return False
+                
+        except Exception as e:
+            self.failed_count += 1
+            logger.error(f"Failed to send email: {e}")
+            return False
+    
+    def send_bulk(self, emails: List[Dict]) -> Dict[str, int]:
+        """Send bulk emails with rate limiting"""
+        success = 0
+        failed = 0
+        
+        for email in emails:
+            if self.send_email(
+                email['to_email'],
+                email.get('to_name', ''),
+                email['subject'],
+                email['html_content'],
+                email.get('plain_text')
+            ):
+                success += 1
+            else:
+                failed += 1
+            
+            # Rate limiting: 10 emails per second
+            time.sleep(0.1)
+        
+        return {'success': success, 'failed': failed}
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get email statistics"""
+        return {
+            'total_sent': self.sent_count,
+            'total_failed': self.failed_count
+        }
+
+# ==================== EMAIL TEMPLATES ====================
+
+class EmailTemplates:
+    """HTML email templates for different use cases"""
+    
+    @staticmethod
+    def welcome_email(username: str, xcoin_bonus: int, dashboard_url: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Welcome to XStore</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+                    line-height: 1.6;
+                    color: #333;
+                    margin: 0;
+                    padding: 0;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    padding: 40px 20px;
+                }}
+                .content {{
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.1);
+                }}
+                .logo {{
+                    text-align: center;
+                    margin-bottom: 30px;
+                }}
+                .logo h1 {{
+                    font-size: 36px;
+                    background: linear-gradient(135deg, #667eea, #764ba2);
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    margin: 0;
+                }}
+                .welcome-badge {{
+                    background: linear-gradient(135deg, #f59e0b, #fbbf24);
+                    color: white;
+                    padding: 20px;
+                    border-radius: 12px;
+                    text-align: center;
+                    margin: 30px 0;
+                }}
+                .welcome-badge .xcoin-amount {{
+                    font-size: 48px;
+                    font-weight: bold;
+                    margin: 10px 0;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 30px;
+                    background: linear-gradient(135deg, #667eea, #764ba2);
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                    margin-top: 20px;
+                    font-weight: 600;
+                }}
+                .features {{
+                    margin: 30px 0;
+                    padding: 0;
+                    list-style: none;
+                }}
+                .features li {{
+                    padding: 10px 0;
+                    border-bottom: 1px solid #eee;
+                }}
+                .footer {{
+                    text-align: center;
+                    margin-top: 30px;
+                    padding-top: 20px;
+                    border-top: 1px solid #eee;
+                    font-size: 12px;
+                    color: #999;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="content">
+                    <div class="logo">
+                        <h1>✨ XSTORE ✨</h1>
+                    </div>
+                    
+                    <h2>Welcome {username}!</h2>
+                    
+                    <p>Thank you for joining XStore! We're excited to have you as part of our digital marketplace community.</p>
+                    
+                    <div class="welcome-badge">
+                        🎁 <strong>Welcome Gift</strong>
+                        <div class="xcoin-amount">⚡ +{xcoin_bonus} X Coin</div>
+                        <div>Added to your account!</div>
+                    </div>
+                    
+                    <h3>What you can do:</h3>
+                    <ul class="features">
+                        <li>🛍️ Browse thousands of digital products</li>
+                        <li>⚡ Earn X Coin with every purchase</li>
+                        <li>🎮 Link your Roblox account for instant purchases</li>
+                        <li>💸 Earn affiliate commissions by referring friends</li>
+                        <li>🎫 Use discount codes for extra savings</li>
+                    </ul>
+                    
+                    <center>
+                        <a href="{dashboard_url}" class="button">Start Shopping →</a>
+                    </center>
+                    
+                    <div class="footer">
+                        <p>Need help? Contact us at support@xstore.com</p>
+                        <p>© 2024 XStore. All rights reserved.</p>
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+    
+    @staticmethod
+    def order_confirmation(username: str, order_id: int, items_html: str, total_usd: float, 
+                          payment_method: str, status: str, dashboard_url: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    line-height: 1.6;
+                    color: #333;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }}
+                .header {{
+                    text-align: center;
+                    border-bottom: 2px solid #667eea;
+                    padding-bottom: 20px;
+                    margin-bottom: 30px;
+                }}
+                .order-details {{
+                    background: #f8f9fa;
+                    border-radius: 12px;
+                    padding: 20px;
+                    margin: 20px 0;
+                }}
+                .item {{
+                    padding: 10px 0;
+                    border-bottom: 1px solid #e0e0e0;
+                }}
+                .total {{
+                    font-size: 20px;
+                    font-weight: bold;
+                    color: #667eea;
+                    margin-top: 15px;
+                    text-align: right;
+                }}
+                .status-badge {{
+                    display: inline-block;
+                    padding: 4px 12px;
+                    background: #10b981;
+                    color: white;
+                    border-radius: 20px;
+                    font-size: 12px;
+                    font-weight: 600;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 24px;
+                    background: #667eea;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                    margin-top: 20px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h2>✅ Order Confirmed!</h2>
+                    <p>Order #{order_id}</p>
+                    <span class="status-badge">{status}</span>
+                </div>
+                
+                <p>Hello {username},</p>
+                <p>Your order has been confirmed and is being processed.</p>
+                
+                <div class="order-details">
+                    <h3>Order Items:</h3>
+                    {items_html}
+                    <div class="total">Total: ${total_usd:.2f}</div>
+                    <div>Payment Method: {payment_method}</div>
+                </div>
+                
+                <center>
+                    <a href="{dashboard_url}" class="button">View Order Details →</a>
+                </center>
+                
+                <p style="margin-top: 30px; font-size: 12px; color: #999; text-align: center;">
+                    Thank you for shopping with XStore!
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+    
+    @staticmethod
+    def xcoin_purchase(username: str, xcoin_amount: int, new_balance: int, 
+                       purchase_method: str, dashboard_url: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                }}
+                .xcoin-card {{
+                    background: linear-gradient(135deg, #f59e0b, #fbbf24);
+                    border-radius: 16px;
+                    padding: 30px;
+                    text-align: center;
+                    color: white;
+                    margin: 30px 0;
+                }}
+                .xcoin-amount {{
+                    font-size: 64px;
+                    font-weight: bold;
+                    margin: 20px 0;
+                }}
+                .balance {{
+                    background: #f8f9fa;
+                    border-radius: 12px;
+                    padding: 15px;
+                    text-align: center;
+                    margin: 20px 0;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 24px;
+                    background: #667eea;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>⚡ X Coin Added!</h2>
+                <p>Hello {username},</p>
+                
+                <div class="xcoin-card">
+                    <div>You received:</div>
+                    <div class="xcoin-amount">+{xcoin_amount:,} X Coin</div>
+                    <div>via {purchase_method}</div>
+                </div>
+                
+                <div class="balance">
+                    <strong>New Balance:</strong> {new_balance:,} X Coin
+                </div>
+                
+                <center>
+                    <a href="{dashboard_url}" class="button">View Balance →</a>
+                </center>
+            </div>
+        </body>
+        </html>
+        """
+    
+    @staticmethod
+    def affiliate_commission(username: str, commission_amount: float, 
+                            referral_link: str, dashboard_url: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                }}
+                .commission-card {{
+                    background: linear-gradient(135deg, #10b981, #34d399);
+                    border-radius: 16px;
+                    padding: 30px;
+                    text-align: center;
+                    color: white;
+                    margin: 30px 0;
+                }}
+                .commission-amount {{
+                    font-size: 48px;
+                    font-weight: bold;
+                    margin: 20px 0;
+                }}
+                .referral-link {{
+                    background: #f8f9fa;
+                    border-radius: 12px;
+                    padding: 15px;
+                    word-break: break-all;
+                    margin: 20px 0;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 24px;
+                    background: #667eea;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>💰 New Affiliate Commission!</h2>
+                <p>Hello {username},</p>
+                
+                <div class="commission-card">
+                    <div>You earned:</div>
+                    <div class="commission-amount">${commission_amount:.2f}</div>
+                    <div>from a referral purchase</div>
+                </div>
+                
+                <div class="referral-link">
+                    <strong>Your Referral Link:</strong><br>
+                    {referral_link}
+                </div>
+                
+                <center>
+                    <a href="{dashboard_url}" class="button">View Earnings →</a>
+                </center>
+            </div>
+        </body>
+        </html>
+        """
+    
+    @staticmethod
+    def password_reset(username: str, reset_code: str, reset_url: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                }}
+                .reset-code {{
+                    background: #f8f9fa;
+                    font-size: 36px;
+                    font-weight: bold;
+                    letter-spacing: 5px;
+                    text-align: center;
+                    padding: 20px;
+                    border-radius: 12px;
+                    margin: 30px 0;
+                    font-family: monospace;
+                }}
+                .warning {{
+                    background: #fee2e2;
+                    border-left: 4px solid #ef4444;
+                    padding: 15px;
+                    margin: 20px 0;
+                    font-size: 14px;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 24px;
+                    background: #667eea;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>🔐 Password Reset Request</h2>
+                <p>Hello {username},</p>
+                <p>We received a request to reset your password. Use the code below:</p>
+                
+                <div class="reset-code">{reset_code}</div>
+                
+                <p>Or click the button below:</p>
+                <center>
+                    <a href="{reset_url}" class="button">Reset Password →</a>
+                </center>
+                
+                <div class="warning">
+                    ⚠️ This code expires in 15 minutes. Never share this code with anyone.
+                </div>
+                
+                <p style="font-size: 12px; color: #999; margin-top: 30px;">
+                    If you didn't request this, you can safely ignore this email.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+    
+    @staticmethod
+    def coupon_email(username: str, coupon_code: str, discount_value: float, 
+                    discount_type: str, expiry_days: int, shop_url: str) -> str:
+        expiry_text = f"Expires in {expiry_days} days!" if expiry_days else "Limited time offer!"
+        discount_text = f"{discount_value}%" if discount_type == "percentage" else f"${discount_value}"
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                }}
+                .coupon-card {{
+                    background: linear-gradient(135deg, #667eea, #764ba2);
+                    border-radius: 16px;
+                    padding: 30px;
+                    text-align: center;
+                    color: white;
+                    margin: 30px 0;
+                }}
+                .coupon-code {{
+                    font-size: 32px;
+                    font-weight: bold;
+                    letter-spacing: 4px;
+                    background: white;
+                    color: #667eea;
+                    padding: 15px;
+                    border-radius: 8px;
+                    margin: 20px 0;
+                    font-family: monospace;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 24px;
+                    background: #667eea;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>🎫 You've Got a Coupon!</h2>
+                <p>Hello {username},</p>
+                
+                <div class="coupon-card">
+                    <div>Special Offer Just for You!</div>
+                    <div class="coupon-code">{coupon_code}</div>
+                    <div style="font-size: 24px; margin: 10px 0;">{discount_text} OFF</div>
+                    <div>{expiry_text}</div>
+                </div>
+                
+                <center>
+                    <a href="{shop_url}" class="button">Shop Now →</a>
+                </center>
+            </div>
+        </body>
+        </html>
+        """
+    
+    @staticmethod
+    def low_stock_alert(product_name: str, current_stock: int, sales_today: int, admin_url: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    padding: 40px;
+                }}
+                .alert-card {{
+                    background: #fee2e2;
+                    border-left: 4px solid #ef4444;
+                    border-radius: 12px;
+                    padding: 20px;
+                    margin: 20px 0;
+                }}
+                .stats {{
+                    background: #f8f9fa;
+                    border-radius: 12px;
+                    padding: 15px;
+                    margin: 20px 0;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 12px 24px;
+                    background: #ef4444;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>⚠️ Low Stock Alert</h2>
+                
+                <div class="alert-card">
+                    <strong>{product_name}</strong> is running low on stock!
+                </div>
+                
+                <div class="stats">
+                    <div>📦 Current Stock: <strong>{current_stock}</strong> units</div>
+                    <div>📈 Sold Today: <strong>{sales_today}</strong> units</div>
+                    <div>⚠️ Action Needed: Restock immediately</div>
+                </div>
+                
+                <center>
+                    <a href="{admin_url}" class="button">Manage Products →</a>
+                </center>
+            </div>
+        </body>
+        </html>
+        """
+
 # ==================== PYDANTIC SCHEMAS ====================
 
 class UserRegister(BaseModel):
@@ -185,14 +874,14 @@ class OrderItem(BaseModel):
 
 class OrderCreate(BaseModel):
     items: List[OrderItem]
-    payment_method: str  # paypal, cashapp, robux, x_coin, split
+    payment_method: str
     x_coin_amount: int = 0
     coupon_code: Optional[str] = None
     cashapp_tag: Optional[str] = None
 
 class CouponCreate(BaseModel):
     code: str
-    discount_type: str  # percentage or fixed
+    discount_type: str
     discount_value: float
     min_purchase: Optional[float] = None
     max_uses: Optional[int] = None
@@ -232,11 +921,26 @@ class RobuxTierCreate(BaseModel):
     xcoin_amount: int
     game_pass_id: str
     game_pass_url: str
+    display_name: str
 
 class ExchangeRatesUpdate(BaseModel):
     robux_to_xcoin: int
     xcoin_to_usd: int
     robux_to_usd: int
+
+# ==================== SENDGRID INITIALIZATION ====================
+
+email_service = None
+
+if settings.SENDGRID_API_KEY and settings.SENDGRID_FROM_EMAIL:
+    email_service = SendGridEmailService(
+        api_key=settings.SENDGRID_API_KEY,
+        from_email=settings.SENDGRID_FROM_EMAIL,
+        from_name=settings.SENDGRID_FROM_NAME
+    )
+    logger.info("SendGrid email service initialized")
+else:
+    logger.warning("SendGrid not configured - email notifications disabled")
 
 # ==================== TRANSLATIONS ====================
 
@@ -244,8 +948,6 @@ TRANSLATIONS = {
     "en": {
         "welcome": "Welcome to XStore!",
         "order_confirmed": "Order #{} confirmed!",
-        "order_shipped": "Order #{} has been shipped!",
-        "review_reply": "Your review for {} has a reply!",
         "affiliate_earnings": "You earned ${} from affiliate commission!",
         "coupon_applied": "Coupon applied! You saved ${}",
         "low_stock": "Product '{}' is running low on stock!",
@@ -254,43 +956,11 @@ TRANSLATIONS = {
     "es": {
         "welcome": "¡Bienvenido a XStore!",
         "order_confirmed": "¡Pedido #{} confirmado!",
-        "order_shipped": "¡El pedido #{} ha sido enviado!",
-        "review_reply": "¡Tu reseña para {} tiene una respuesta!",
         "affiliate_earnings": "¡Ganaste ${} por comisión de afiliado!",
         "coupon_applied": "¡Cupón aplicado! Ahorraste ${}",
         "low_stock": "¡El producto '{}' se está quedando sin stock!",
         "order_pending_robux": "El pedido #{} está pendiente de verificación de Robux",
     },
-    "fr": {
-        "welcome": "Bienvenue sur XStore!",
-        "order_confirmed": "Commande #{} confirmée!",
-        "order_shipped": "La commande #{} a été expédiée!",
-        "review_reply": "Votre avis sur {} a une réponse!",
-        "affiliate_earnings": "Vous avez gagné ${} de commission d'affiliation!",
-        "coupon_applied": "Coupon appliqué! Vous avez économisé ${}",
-        "low_stock": "Le produit '{}' est en rupture de stock!",
-        "order_pending_robux": "La commande #{} est en attente de vérification Robux",
-    },
-    "de": {
-        "welcome": "Willkommen bei XStore!",
-        "order_confirmed": "Bestellung #{} bestätigt!",
-        "order_shipped": "Bestellung #{} wurde versendet!",
-        "review_reply": "Ihre Bewertung für {} hat eine Antwort!",
-        "affiliate_earnings": "Sie haben ${} Provision verdient!",
-        "coupon_applied": "Gutschein angewendet! Sie sparten ${}",
-        "low_stock": "Produkt '{}' ist fast ausverkauft!",
-        "order_pending_robux": "Bestellung #{} wartet auf Robux-Überprüfung",
-    },
-    "ja": {
-        "welcome": "XStoreへようこそ！",
-        "order_confirmed": "注文 #{} が確認されました！",
-        "order_shipped": "注文 #{} が出荷されました！",
-        "review_reply": "{} のレビューに返信があります！",
-        "affiliate_earnings": "アフィリエイト手数料 ${} を獲得しました！",
-        "coupon_applied": "クーポンを適用しました！ ${} 節約しました",
-        "low_stock": "商品 '{}' の在庫が少なくなっています！",
-        "order_pending_robux": "注文 #{} はRobux確認待ちです",
-    }
 }
 
 def translate(key: str, lang: str, **kwargs):
@@ -335,33 +1005,16 @@ async def validate_coupon(code: str, user_id: str, total_usd: float) -> Optional
 
 # ==================== NOTIFICATION SERVICE ====================
 
-async def send_email(to: str, subject: str, html_body: str):
-    if not settings.SMTP_USER or not settings.SMTP_PASS:
-        logging.warning("SMTP not configured")
-        return
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = settings.SMTP_USER
-        msg["To"] = to
-        msg.attach(MIMEText(html_body, "html"))
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as srv:
-            srv.starttls()
-            srv.login(settings.SMTP_USER, settings.SMTP_PASS)
-            srv.sendmail(settings.SMTP_USER, to, msg.as_string())
-    except Exception as e:
-        logging.error(f"Email failed: {e}")
-
-async def send_notification(user_id: str, title: str, message: str, notification_type: str = "info"):
-    user = supabase.table("users").select("email, language, notification_preferences").eq("id", user_id).execute()
+async def send_notification(user_id: str, title: str, message: str, notification_type: str = "info", 
+                           email_data: Dict[str, Any] = None):
+    """Send notification via WebSocket and optionally email"""
+    user = supabase.table("users").select("email, username, language, notification_preferences, x_coin_balance").eq("id", user_id).execute()
     if not user.data:
         return
     user_data = user.data[0]
     prefs = user_data.get("notification_preferences", {})
     
-    if prefs.get("email_order_updates", True) and notification_type in ["order", "refund"]:
-        await send_email(user_data["email"], title, f"<h3>{title}</h3><p>{message}</p>")
-    
+    # Send WebSocket notification
     if user_id in websocket_connections:
         for ws in websocket_connections[user_id]:
             try:
@@ -373,6 +1026,18 @@ async def send_notification(user_id: str, title: str, message: str, notification
                 })
             except:
                 pass
+    
+    # Send email if enabled and we have email_data
+    if email_service and email_data and prefs.get("email_order_updates", True):
+        try:
+            email_service.send_email(
+                to_email=user_data["email"],
+                to_name=user_data["username"],
+                subject=email_data.get("subject", title),
+                html_content=email_data.get("html_content", message)
+            )
+        except Exception as e:
+            logger.error(f"Failed to send email notification: {e}")
 
 # ==================== AFFILIATE FUNCTIONS ====================
 
@@ -419,9 +1084,24 @@ async def process_affiliate_commission(order_id: int, user_id: str, total_usd: f
     
     affiliate_user = supabase.table("affiliates").select("user_id").eq("id", affiliate_id).execute()
     if affiliate_user.data:
-        await send_notification(affiliate_user.data[0]["user_id"], "Affiliate Commission", 
-                               translate("affiliate_earnings", "en", amount=commission),
-                               "earnings")
+        affiliate_data = supabase.table("affiliates").select("*").eq("user_id", affiliate_user.data[0]["user_id"]).execute()
+        referral_link = f"{settings.FRONTEND_URL}/?ref={affiliate_data.data[0]['code']}" if affiliate_data.data else ""
+        
+        await send_notification(
+            affiliate_user.data[0]["user_id"], 
+            "Affiliate Commission", 
+            translate("affiliate_earnings", "en", amount=commission),
+            "earnings",
+            {
+                "subject": f"You Earned ${commission:.2f} from XStore!",
+                "html_content": EmailTemplates.affiliate_commission(
+                    username=affiliate_user.data[0]["user_id"],
+                    commission_amount=commission,
+                    referral_link=referral_link,
+                    dashboard_url=f"{settings.FRONTEND_URL}/dashboard"
+                )
+            }
+        )
 
 # ==================== REVIEW SYSTEM ====================
 
@@ -463,7 +1143,7 @@ app = FastAPI(title="XStore API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000", "http://localhost:8000", "https://xstore.com"],
+    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -473,15 +1153,31 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "2.0.0"}
+    return {
+        "status": "healthy",
+        "version": "2.0.0",
+        "email_service": "configured" if email_service else "disabled"
+    }
 
 @app.get("/")
 async def root():
-    return {"message": "XStore API", "version": "2.0.0", "features": [
-        "Discord OAuth", "Affiliate Program", "Discount Coupons", 
-        "Product Reviews", "Wishlist", "WebSocket Notifications",
-        "Multi-language", "PayPal", "CashApp", "Robux Payments"
-    ]}
+    return {
+        "message": "XStore API",
+        "version": "2.0.0",
+        "features": [
+            "Discord OAuth",
+            "Affiliate Program",
+            "Discount Coupons",
+            "Product Reviews",
+            "Wishlist",
+            "WebSocket Notifications",
+            "Multi-language",
+            "PayPal",
+            "CashApp",
+            "Robux Payments",
+            "SendGrid Email"
+        ]
+    }
 
 # ==================== AUTH ROUTES ====================
 
@@ -495,7 +1191,6 @@ async def register(user_data: UserRegister):
     if existing_username.data:
         raise HTTPException(400, "Username already taken")
     
-    # Create user in Supabase Auth
     auth_response = supabase.auth.sign_up({
         "email": user_data.email,
         "password": user_data.password,
@@ -509,7 +1204,7 @@ async def register(user_data: UserRegister):
         "email": user_data.email,
         "username": user_data.username,
         "language": user_data.language,
-        "x_coin_balance": 0,
+        "x_coin_balance": settings.WELCOME_BONUS_XCOIN,
         "is_owner": is_owner,
         "is_banned": False,
         "notification_preferences": {
@@ -532,9 +1227,26 @@ async def register(user_data: UserRegister):
     supabase.table("logs").insert({
         "user_id": auth_response.user.id,
         "action": "user_register",
-        "details": f"New user registered",
+        "details": f"New user registered: {user_data.username}",
         "created_at": datetime.utcnow().isoformat()
     }).execute()
+    
+    # Send welcome email via SendGrid
+    if email_service:
+        try:
+            email_service.send_email(
+                to_email=user_data.email,
+                to_name=user_data.username,
+                subject="🎉 Welcome to XStore!",
+                html_content=EmailTemplates.welcome_email(
+                    username=user_data.username,
+                    xcoin_bonus=settings.WELCOME_BONUS_XCOIN,
+                    dashboard_url=f"{settings.FRONTEND_URL}/dashboard"
+                )
+            )
+            logger.info(f"Welcome email sent to {user_data.email}")
+        except Exception as e:
+            logger.error(f"Failed to send welcome email: {e}")
     
     access_token = create_access_token({"sub": auth_response.user.id})
     
@@ -546,7 +1258,7 @@ async def register(user_data: UserRegister):
             "email": user_data.email,
             "username": user_data.username,
             "language": user_data.language,
-            "x_coin_balance": 0,
+            "x_coin_balance": settings.WELCOME_BONUS_XCOIN,
             "is_owner": is_owner
         }
     }
@@ -633,6 +1345,38 @@ async def update_language(data: LanguageUpdate, current_user = Depends(require_u
     
     return {"message": "Language updated", "language": data.language}
 
+@app.post("/api/auth/forgot-password")
+async def forgot_password(email: str):
+    """Send password reset email via SendGrid"""
+    user = supabase.table("users").select("id, username").eq("email", email).execute()
+    if not user.data:
+        return {"message": "If that email exists, we've sent a reset code"}
+    
+    reset_code = ''.join(random.choices(string.digits, k=6))
+    
+    supabase.table("password_resets").insert({
+        "user_id": user.data[0]["id"],
+        "code": reset_code,
+        "expires_at": datetime.utcnow() + timedelta(minutes=15),
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    
+    if email_service:
+        reset_url = f"{settings.FRONTEND_URL}/reset-password?code={reset_code}&email={email}"
+        
+        email_service.send_email(
+            to_email=email,
+            to_name=user.data[0]["username"],
+            subject="🔐 Password Reset - XStore",
+            html_content=EmailTemplates.password_reset(
+                username=user.data[0]["username"],
+                reset_code=reset_code,
+                reset_url=reset_url
+            )
+        )
+    
+    return {"message": "If that email exists, we've sent a reset code"}
+
 # ==================== DISCORD OAUTH ====================
 
 @app.get("/api/auth/discord")
@@ -696,7 +1440,7 @@ async def discord_callback(code: str):
         "discord_id": discord_user["id"],
         "discord_avatar": discord_user.get("avatar"),
         "language": settings.DEFAULT_LANGUAGE,
-        "x_coin_balance": 0,
+        "x_coin_balance": settings.WELCOME_BONUS_XCOIN,
         "is_owner": False,
         "is_banned": False,
         "notification_preferences": {
@@ -716,6 +1460,19 @@ async def discord_callback(code: str):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
+    # Send welcome email
+    if email_service:
+        email_service.send_email(
+            to_email=email,
+            to_name=username,
+            subject="🎉 Welcome to XStore!",
+            html_content=EmailTemplates.welcome_email(
+                username=username,
+                xcoin_bonus=settings.WELCOME_BONUS_XCOIN,
+                dashboard_url=f"{settings.FRONTEND_URL}/dashboard"
+            )
+        )
+    
     access_token = create_access_token({"sub": auth_response.user.id})
     
     return {"access_token": access_token, "token_type": "bearer", "user": {
@@ -723,7 +1480,7 @@ async def discord_callback(code: str):
         "email": email,
         "username": username,
         "language": settings.DEFAULT_LANGUAGE,
-        "x_coin_balance": 0,
+        "x_coin_balance": settings.WELCOME_BONUS_XCOIN,
         "is_owner": False
     }}
 
@@ -862,9 +1619,12 @@ async def reply_to_review(review_id: int, reply: str):
     
     review = supabase.table("reviews").select("user_id, product:products(title)").eq("id", review_id).execute()
     if review.data:
-        await send_notification(review.data[0]["user_id"], "Review Reply", 
-                               translate("review_reply", "en", product=review.data[0]["product"]["title"]),
-                               "review")
+        await send_notification(
+            review.data[0]["user_id"], 
+            "Review Reply", 
+            f"A merchant replied to your review on {review.data[0]['product']['title']}",
+            "review"
+        )
     
     return {"message": "Reply added"}
 
@@ -927,6 +1687,28 @@ async def create_coupon(coupon: CouponCreate):
         "details": f"Created coupon: {coupon.code}",
         "created_at": datetime.utcnow().isoformat()
     }).execute()
+    
+    # Send coupon email if user_id specified
+    if coupon.user_id and email_service:
+        user = supabase.table("users").select("email, username").eq("id", coupon.user_id).execute()
+        if user.data:
+            expiry_days = 7
+            if coupon.expires_at:
+                expiry_days = (coupon.expires_at - datetime.utcnow()).days
+            
+            email_service.send_email(
+                to_email=user.data[0]["email"],
+                to_name=user.data[0]["username"],
+                subject=f"🎫 Your XStore Coupon: {coupon.code}",
+                html_content=EmailTemplates.coupon_email(
+                    username=user.data[0]["username"],
+                    coupon_code=coupon.code,
+                    discount_value=coupon.discount_value,
+                    discount_type=coupon.discount_type,
+                    expiry_days=expiry_days,
+                    shop_url=f"{settings.FRONTEND_URL}/shop"
+                )
+            )
     
     return response.data[0]
 
@@ -1061,9 +1843,21 @@ async def create_order(order_data: OrderCreate, request: Request, current_user =
         supabase.table("products").update({"stock": new_stock}).eq("id", product["id"]).execute()
         
         if new_stock <= 5:
-            await send_notification("admin", "Low Stock Alert", 
-                                   translate("low_stock", "en", product=product["title"]),
-                                   "alert")
+            await send_notification(
+                settings.ADMIN_EMAIL, 
+                "Low Stock Alert", 
+                translate("low_stock", "en", product=product["title"]),
+                "alert",
+                {
+                    "subject": f"⚠️ Low Stock: {product['title']}",
+                    "html_content": EmailTemplates.low_stock_alert(
+                        product_name=product["title"],
+                        current_stock=new_stock,
+                        sales_today=1,
+                        admin_url=f"{settings.FRONTEND_URL}/admin"
+                    )
+                }
+            )
     
     affiliate_cookie = request.cookies.get("affiliate_code")
     if affiliate_cookie:
@@ -1078,48 +1872,31 @@ async def create_order(order_data: OrderCreate, request: Request, current_user =
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    if order["status"] == "completed":
-        await send_notification(current_user["id"], "Order Confirmed", 
-                               translate("order_confirmed", current_user.get("language", "en"), order_id=order_id),
-                               "order")
-    elif order["status"] == "awaiting_robux":
-        required_passes = []
-        if order_data.payment_method == "robux" or (order_data.payment_method == "split" and remaining_usd > 0):
-            robux_needed = int(remaining_usd * settings.ROBUX_TO_USD_RATE)
-            tiers = supabase.table("robux_tiers").select("*").order("robux_cost").execute()
-            
-            remaining_robux = robux_needed
-            for tier in tiers.data:
-                if remaining_robux <= 0:
-                    break
-                if tier["robux_cost"] <= remaining_robux:
-                    required_passes.append({
-                        "game_pass_id": tier["game_pass_id"],
-                        "game_pass_url": tier["game_pass_url"],
-                        "robux_amount": tier["robux_cost"]
-                    })
-                    remaining_robux -= tier["robux_cost"]
-            
-            if remaining_robux > 0 and tiers.data:
-                required_passes.append({
-                    "game_pass_id": tiers.data[-1]["game_pass_id"],
-                    "game_pass_url": tiers.data[-1]["game_pass_url"],
-                    "robux_amount": remaining_robux
-                })
-            
-            verification_sessions[str(order_id)] = {
-                "status": "pending",
-                "user_id": current_user["id"],
-                "roblox_id": current_user.get("roblox_id"),
-                "required_passes": required_passes,
-                "order_id": order_id,
-                "created_at": datetime.utcnow().isoformat()
-            }
-            
-            if current_user.get("roblox_id"):
-                await send_notification(current_user["id"], "Order Pending Robux", 
-                                       translate("order_pending_robux", current_user.get("language", "en"), order_id=order_id),
-                                       "order")
+    # Send order confirmation email
+    if order["status"] == "completed" and email_service:
+        items_html = ""
+        for product in products:
+            items_html += f"""
+            <div class="item">
+                <strong>{product['title']}</strong> x {product['quantity']}<br>
+                ${product['price_usd']:.2f} each
+            </div>
+            """
+        
+        email_service.send_email(
+            to_email=current_user["email"],
+            to_name=current_user["username"],
+            subject=f"✅ Order Confirmed #{order_id} - XStore",
+            html_content=EmailTemplates.order_confirmation(
+                username=current_user["username"],
+                order_id=order_id,
+                items_html=items_html,
+                total_usd=total_usd,
+                payment_method=order_data.payment_method,
+                status="completed",
+                dashboard_url=f"{settings.FRONTEND_URL}/dashboard"
+            )
+        )
     
     return {
         "order_id": order_id,
@@ -1128,8 +1905,7 @@ async def create_order(order_data: OrderCreate, request: Request, current_user =
         "original_total": order["original_total_usd"],
         "discount": coupon_discount,
         "x_coin_used": x_coin_used,
-        "remaining_usd": remaining_usd,
-        "required_passes": verification_sessions.get(str(order_id), {}).get("required_passes", []) if order["status"] == "awaiting_robux" else []
+        "remaining_usd": remaining_usd
     }
 
 @app.post("/api/robux/verify/{order_id}")
@@ -1161,9 +1937,12 @@ async def verify_robux_order(order_id: int, current_user = Depends(require_user)
     session["status"] = "completed"
     del verification_sessions[str(order_id)]
     
-    await send_notification(current_user["id"], "Order Completed", 
-                           f"Your Robux verification for order #{order_id} was successful!",
-                           "order")
+    await send_notification(
+        current_user["id"], 
+        "Order Completed", 
+        f"Your Robux verification for order #{order_id} was successful!",
+        "order"
+    )
     
     return {
         "success": True,
@@ -1215,89 +1994,129 @@ async def get_xcoin_balance(current_user = Depends(require_user)):
         "xcoin_to_usd_rate": settings.XCOIN_TO_USD_RATE
     }
 
-@app.get("/api/xcoin/packages")
-async def get_xcoin_packages():
-    packages = supabase.table("robux_tiers").select("*").eq("is_active", True).order("robux_cost").execute()
-    for pkg in packages.data:
-        pkg["xcoin_amount"] = pkg["robux_cost"] * settings.ROBUX_TO_XCOIN_RATE
-        pkg["usd_equivalent"] = pkg["robux_cost"] / settings.ROBUX_TO_USD_RATE
-    return packages.data
+@app.get("/api/xcoin/tiers")
+async def get_xcoin_tiers():
+    tiers = supabase.table("robux_tiers").select("*").eq("is_active", True).order("robux_cost").execute()
+    
+    result = []
+    for tier in tiers.data:
+        result.append({
+            "id": tier["id"],
+            "robux_cost": tier["robux_cost"],
+            "usd_value": tier["robux_cost"] / settings.ROBUX_TO_USD_RATE,
+            "xcoin_amount": tier["xcoin_amount"],
+            "game_pass_id": tier["game_pass_id"],
+            "game_pass_url": tier["game_pass_url"],
+            "display_name": tier.get("display_name", f"{tier['robux_cost']} Robux"),
+            "bonus_percentage": round((tier["xcoin_amount"] / (tier["robux_cost"] * settings.ROBUX_TO_XCOIN_RATE) - 1) * 100, 1)
+        })
+    
+    return result
 
-@app.post("/api/xcoin/buy")
-async def buy_xcoin_with_robux(request: Request, current_user = Depends(require_user)):
+@app.post("/api/xcoin/buy/tier")
+async def buy_xcoin_with_tier(request: Request, current_user = Depends(require_user)):
     data = await request.json()
-    robux_tier_id = data.get("robux_tier_id")
+    tier_id = data.get("tier_id")
     
     if not current_user.get("roblox_id"):
         raise HTTPException(400, "Please link your Roblox account first")
     
-    tier_response = supabase.table("robux_tiers").select("*").eq("id", robux_tier_id).execute()
+    tier_response = supabase.table("robux_tiers").select("*").eq("id", tier_id).execute()
     if not tier_response.data:
         raise HTTPException(404, "Tier not found")
     
     tier = tier_response.data[0]
-    xcoin_amount = tier["robux_cost"] * settings.ROBUX_TO_XCOIN_RATE
     
     session_id = f"{current_user['id']}_{datetime.utcnow().timestamp()}"
     verification_sessions[session_id] = {
+        "type": "xcoin_purchase",
         "status": "pending",
         "user_id": current_user["id"],
         "roblox_id": current_user["roblox_id"],
         "game_pass_id": tier["game_pass_id"],
         "robux_cost": tier["robux_cost"],
-        "xcoin_amount": xcoin_amount,
+        "xcoin_amount": tier["xcoin_amount"],
+        "tier_name": tier.get("display_name", f"{tier['robux_cost']} Robux"),
         "created_at": datetime.utcnow().isoformat()
     }
     
     return {
         "session_id": session_id,
         "status": "pending",
-        "message": "Please purchase the game pass on Roblox, then click verify",
-        "game_pass_url": tier["game_pass_url"],
-        "game_pass_id": tier["game_pass_id"],
-        "robux_cost": tier["robux_cost"],
-        "xcoin_received": xcoin_amount,
+        "tier": {
+            "display_name": tier.get("display_name"),
+            "robux_cost": tier["robux_cost"],
+            "usd_value": tier["robux_cost"] / settings.ROBUX_TO_USD_RATE,
+            "xcoin_amount": tier["xcoin_amount"],
+            "game_pass_url": tier["game_pass_url"]
+        },
         "expires_in": 120
     }
 
-@app.post("/api/xcoin/verify")
+@app.post("/api/xcoin/verify/purchase")
 async def verify_xcoin_purchase(request: Request, current_user = Depends(require_user)):
     data = await request.json()
     session_id = data.get("session_id")
     
     session = verification_sessions.get(session_id)
     if not session:
-        raise HTTPException(404, "Session not found")
+        raise HTTPException(404, "Verification session not found")
+    
     if session["user_id"] != current_user["id"]:
-        raise HTTPException(403, "Access denied")
+        raise HTTPException(403, "Not your purchase")
     
-    verified = await verify_roblox_game_pass(current_user["roblox_id"], session["game_pass_id"])
+    if not current_user.get("roblox_id"):
+        raise HTTPException(400, "Roblox account not linked")
     
-    if not verified:
+    has_pass = await verify_roblox_game_pass(current_user["roblox_id"], session["game_pass_id"])
+    
+    if not has_pass:
         return {
             "success": False,
-            "message": "Game pass not found. Please purchase it first."
+            "message": "You haven't purchased this game pass yet. Buy it on Roblox first!"
+        }
+    
+    existing = supabase.table("xcoin_transactions").select("id").eq("user_id", current_user["id"]).eq("reason", f"Robux purchase: {session['game_pass_id']}").execute()
+    if existing.data:
+        return {
+            "success": False,
+            "message": "You've already claimed X Coin for this game pass!"
         }
     
     new_balance = current_user["x_coin_balance"] + session["xcoin_amount"]
     supabase.table("users").update({"x_coin_balance": new_balance}).eq("id", current_user["id"]).execute()
+    
     supabase.table("xcoin_transactions").insert({
         "user_id": current_user["id"],
         "amount": session["xcoin_amount"],
-        "reason": f"Purchased with {session['robux_cost']} Robux",
+        "reason": f"Robux purchase: {session['tier_name']} ({session['robux_cost']} Robux)",
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
     del verification_sessions[session_id]
     
-    await send_notification(current_user["id"], "X Coin Purchased",
-                           f"You received {session['xcoin_amount']} X Coin!",
-                           "xcoin")
+    await send_notification(
+        current_user["id"], 
+        "X Coin Purchased! 🎉", 
+        f"You received {session['xcoin_amount']:,} X Coin! New balance: {new_balance:,}",
+        "xcoin",
+        {
+            "subject": f"⚡ You Received {session['xcoin_amount']:,} X Coin!",
+            "html_content": EmailTemplates.xcoin_purchase(
+                username=current_user["username"],
+                xcoin_amount=session["xcoin_amount"],
+                new_balance=new_balance,
+                purchase_method=session['tier_name'],
+                dashboard_url=f"{settings.FRONTEND_URL}/dashboard"
+            )
+        }
+    )
     
     return {
         "success": True,
-        "xcoin_received": session["xcoin_amount"],
-        "new_balance": new_balance
+        "xcoin_amount": session["xcoin_amount"],
+        "new_balance": new_balance,
+        "message": f"Successfully added {session['xcoin_amount']:,} X Coin to your account!"
     }
 
 @app.get("/api/xcoin/transactions")
@@ -1414,9 +2233,12 @@ async def admin_complete_order(order_id: int):
     
     supabase.table("orders").update({"status": "completed"}).eq("id", order_id).execute()
     
-    await send_notification(order.data[0]["user_id"], "Order Completed", 
-                           f"Order #{order_id} has been completed!",
-                           "order")
+    await send_notification(
+        order.data[0]["user_id"], 
+        "Order Completed", 
+        f"Order #{order_id} has been completed!",
+        "order"
+    )
     
     return {"message": "Order completed"}
 
@@ -1446,9 +2268,16 @@ async def admin_refund_order(refund_data: RefundOrder):
     
     supabase.table("orders").update({"status": "refunded"}).eq("id", refund_data.order_id).execute()
     
-    await send_notification(order["user_id"], "Order Refunded",
-                           f"Order #{order['id']} has been refunded. You received {refund_x_coin} X Coin.",
-                           "refund")
+    await send_notification(
+        order["user_id"], 
+        "Order Refunded", 
+        f"Order #{order['id']} has been refunded. You received {refund_x_coin} X Coin.",
+        "refund",
+        {
+            "subject": f"🔄 Order #{order['id']} Refunded",
+            "html_content": f"<h2>Order Refunded</h2><p>You received {refund_x_coin} X Coin.</p>"
+        }
+    )
     
     supabase.table("logs").insert({
         "action": "order_refund",
@@ -1464,7 +2293,7 @@ async def admin_get_users():
 
 @app.post("/api/admin/users/xcoin", dependencies=[Depends(require_owner)])
 async def admin_adjust_xcoin(adjustment: XCoinAdjustment):
-    user = supabase.table("users").select("x_coin_balance, language").eq("id", adjustment.user_id).execute()
+    user = supabase.table("users").select("x_coin_balance, email, username, language").eq("id", adjustment.user_id).execute()
     if not user.data:
         raise HTTPException(404, "User not found")
     
@@ -1480,9 +2309,22 @@ async def admin_adjust_xcoin(adjustment: XCoinAdjustment):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    await send_notification(adjustment.user_id, "X Coin Adjustment",
-                           f"Your X Coin balance has been adjusted by {adjustment.amount}. New balance: {new_balance}",
-                           "xcoin")
+    await send_notification(
+        adjustment.user_id, 
+        "X Coin Adjustment", 
+        f"Your X Coin balance has been adjusted by {adjustment.amount}. New balance: {new_balance}",
+        "xcoin",
+        {
+            "subject": "⚡ X Coin Balance Updated",
+            "html_content": EmailTemplates.xcoin_purchase(
+                username=user.data[0]["username"],
+                xcoin_amount=adjustment.amount,
+                new_balance=new_balance,
+                purchase_method="Admin Adjustment",
+                dashboard_url=f"{settings.FRONTEND_URL}/dashboard"
+            )
+        }
+    )
     
     return {"message": f"Balance updated to {new_balance}"}
 
@@ -1511,6 +2353,7 @@ async def admin_create_robux_tier(tier: RobuxTierCreate):
         "xcoin_amount": tier.robux_cost * settings.ROBUX_TO_XCOIN_RATE,
         "game_pass_id": tier.game_pass_id,
         "game_pass_url": tier.game_pass_url,
+        "display_name": tier.display_name,
         "is_active": True,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
@@ -1523,7 +2366,8 @@ async def admin_update_robux_tier(tier_id: int, tier: RobuxTierCreate):
         "robux_cost": tier.robux_cost,
         "xcoin_amount": tier.robux_cost * settings.ROBUX_TO_XCOIN_RATE,
         "game_pass_id": tier.game_pass_id,
-        "game_pass_url": tier.game_pass_url
+        "game_pass_url": tier.game_pass_url,
+        "display_name": tier.display_name
     }).eq("id", tier_id).execute()
     
     if not response.data:
@@ -1546,12 +2390,10 @@ async def admin_get_exchange_rates():
 
 @app.put("/api/admin/exchange-rates", dependencies=[Depends(require_owner)])
 async def admin_update_exchange_rates(rates: ExchangeRatesUpdate):
-    # Update environment variables (in production, store in DB)
     settings.ROBUX_TO_XCOIN_RATE = rates.robux_to_xcoin
     settings.XCOIN_TO_USD_RATE = rates.xcoin_to_usd
     settings.ROBUX_TO_USD_RATE = rates.robux_to_usd
     
-    # Also update all robux tiers xcoin amounts
     tiers = supabase.table("robux_tiers").select("*").execute()
     for tier in tiers.data:
         supabase.table("robux_tiers").update({
@@ -1565,6 +2407,12 @@ async def admin_update_exchange_rates(rates: ExchangeRatesUpdate):
     }).execute()
     
     return {"message": "Rates updated"}
+
+@app.get("/api/admin/email-stats", dependencies=[Depends(require_owner)])
+async def admin_get_email_stats():
+    if not email_service:
+        return {"error": "Email service not configured"}
+    return email_service.get_stats()
 
 @app.get("/api/admin/logs", dependencies=[Depends(require_owner)])
 async def admin_get_logs(limit: int = 100, offset: int = 0):

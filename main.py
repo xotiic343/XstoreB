@@ -29,9 +29,8 @@ from dotenv import load_dotenv
 
 # SendGrid imports
 import sendgrid
-from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, Personalization
+from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment
 from sendgrid.helpers.mail import Mail as SendGridMail
-import base64
 
 load_dotenv()
 
@@ -45,13 +44,13 @@ class Settings:
     
     # SendGrid
     SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-    SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "noreply@xstore.com")
-    SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "XStore Marketplace")
+    SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
+    SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME")
     
     # Discord OAuth
     DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
     DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-    DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "http://localhost:8000/api/auth/discord/callback")
+    DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
     
     # Payment Gateways
     PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
@@ -77,8 +76,8 @@ class Settings:
     AFFILIATE_COOKIE_DAYS = int(os.getenv("AFFILIATE_COOKIE_DAYS", 30))
     
     # Admin
-    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@xstore.com")
-    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
     
     # Security
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here-change-in-production")
@@ -112,7 +111,7 @@ security = HTTPBearer(auto_error=False)
 
 # Verification sessions storage
 verification_sessions: Dict[str, dict] = {}
-websocket_connections: Dict[str, List[WebSocket]] = {}
+websocket_connections: Dict[str, List[WebSocket]] = []
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -211,28 +210,6 @@ class SendGridEmailService:
             logger.error(f"Failed to send email: {e}")
             return False
     
-    def send_bulk(self, emails: List[Dict]) -> Dict[str, int]:
-        """Send bulk emails with rate limiting"""
-        success = 0
-        failed = 0
-        
-        for email in emails:
-            if self.send_email(
-                email['to_email'],
-                email.get('to_name', ''),
-                email['subject'],
-                email['html_content'],
-                email.get('plain_text')
-            ):
-                success += 1
-            else:
-                failed += 1
-            
-            # Rate limiting: 10 emails per second
-            time.sleep(0.1)
-        
-        return {'success': success, 'failed': failed}
-    
     def get_stats(self) -> Dict[str, int]:
         """Get email statistics"""
         return {
@@ -253,7 +230,6 @@ class EmailTemplates:
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Welcome to XStore</title>
             <style>
                 body {{
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
@@ -923,6 +899,14 @@ class RobuxTierCreate(BaseModel):
     game_pass_url: str
     display_name: str
 
+class RobuxTierUpdate(BaseModel):
+    robux_cost: Optional[int] = None
+    xcoin_amount: Optional[int] = None
+    game_pass_id: Optional[str] = None
+    game_pass_url: Optional[str] = None
+    display_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
 class ExchangeRatesUpdate(BaseModel):
     robux_to_xcoin: int
     xcoin_to_usd: int
@@ -1231,7 +1215,7 @@ async def register(user_data: UserRegister):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    # Send welcome email via SendGrid
+    # Send welcome email
     if email_service:
         try:
             email_service.send_email(
@@ -1347,7 +1331,6 @@ async def update_language(data: LanguageUpdate, current_user = Depends(require_u
 
 @app.post("/api/auth/forgot-password")
 async def forgot_password(email: str):
-    """Send password reset email via SendGrid"""
     user = supabase.table("users").select("id, username").eq("email", email).execute()
     if not user.data:
         return {"message": "If that email exists, we've sent a reset code"}
@@ -1460,7 +1443,6 @@ async def discord_callback(code: str):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    # Send welcome email
     if email_service:
         email_service.send_email(
             to_email=email,
@@ -1688,7 +1670,6 @@ async def create_coupon(coupon: CouponCreate):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    # Send coupon email if user_id specified
     if coupon.user_id and email_service:
         user = supabase.table("users").select("email, username").eq("id", coupon.user_id).execute()
         if user.data:
@@ -1872,7 +1853,6 @@ async def create_order(order_data: OrderCreate, request: Request, current_user =
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    # Send order confirmation email
     if order["status"] == "completed" and email_service:
         items_html = ""
         for product in products:
@@ -2000,15 +1980,18 @@ async def get_xcoin_tiers():
     
     result = []
     for tier in tiers.data:
+        expected_xcoin = tier["robux_cost"] * settings.ROBUX_TO_XCOIN_RATE
+        bonus_percentage = round((tier["xcoin_amount"] / expected_xcoin - 1) * 100, 1) if expected_xcoin > 0 else 0
+        
         result.append({
             "id": tier["id"],
             "robux_cost": tier["robux_cost"],
-            "usd_value": tier["robux_cost"] / settings.ROBUX_TO_USD_RATE,
+            "usd_value": round(tier["robux_cost"] / settings.ROBUX_TO_USD_RATE, 2),
             "xcoin_amount": tier["xcoin_amount"],
             "game_pass_id": tier["game_pass_id"],
             "game_pass_url": tier["game_pass_url"],
-            "display_name": tier.get("display_name", f"{tier['robux_cost']} Robux"),
-            "bonus_percentage": round((tier["xcoin_amount"] / (tier["robux_cost"] * settings.ROBUX_TO_XCOIN_RATE) - 1) * 100, 1)
+            "display_name": tier.get("display_name", f"{tier['robux_cost']} Robux Pack"),
+            "bonus_percentage": bonus_percentage
         })
     
     return result
@@ -2046,7 +2029,7 @@ async def buy_xcoin_with_tier(request: Request, current_user = Depends(require_u
         "tier": {
             "display_name": tier.get("display_name"),
             "robux_cost": tier["robux_cost"],
-            "usd_value": tier["robux_cost"] / settings.ROBUX_TO_USD_RATE,
+            "usd_value": round(tier["robux_cost"] / settings.ROBUX_TO_USD_RATE, 2),
             "xcoin_amount": tier["xcoin_amount"],
             "game_pass_url": tier["game_pass_url"]
         },
@@ -2341,16 +2324,30 @@ async def admin_ban_user(user_id: str):
 
 @app.get("/api/admin/robux-tiers", dependencies=[Depends(require_owner)])
 async def admin_get_robux_tiers():
-    return supabase.table("robux_tiers").select("*").order("robux_cost").execute().data
+    tiers = supabase.table("robux_tiers").select("*").order("robux_cost").execute()
+    
+    for tier in tiers.data:
+        tier["usd_value"] = round(tier["robux_cost"] / settings.ROBUX_TO_USD_RATE, 2)
+        expected_xcoin = tier["robux_cost"] * settings.ROBUX_TO_XCOIN_RATE
+        tier["bonus_percentage"] = round((tier["xcoin_amount"] / expected_xcoin - 1) * 100, 1) if expected_xcoin > 0 else 0
+    
+    return tiers.data
 
 @app.post("/api/admin/robux-tiers", dependencies=[Depends(require_owner)])
 async def admin_create_robux_tier(tier: RobuxTierCreate):
     if tier.robux_cost <= 0:
         raise HTTPException(400, "Robux cost must be positive")
     
+    if tier.xcoin_amount <= 0:
+        raise HTTPException(400, "X Coin amount must be positive")
+    
+    existing = supabase.table("robux_tiers").select("*").eq("robux_cost", tier.robux_cost).execute()
+    if existing.data:
+        raise HTTPException(400, f"Tier with {tier.robux_cost} Robux already exists")
+    
     response = supabase.table("robux_tiers").insert({
         "robux_cost": tier.robux_cost,
-        "xcoin_amount": tier.robux_cost * settings.ROBUX_TO_XCOIN_RATE,
+        "xcoin_amount": tier.xcoin_amount,
         "game_pass_id": tier.game_pass_id,
         "game_pass_url": tier.game_pass_url,
         "display_name": tier.display_name,
@@ -2358,26 +2355,70 @@ async def admin_create_robux_tier(tier: RobuxTierCreate):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
+    supabase.table("logs").insert({
+        "action": "robux_tier_create",
+        "details": f"Created Robux tier: {tier.robux_cost} Robux -> {tier.xcoin_amount} X Coin - {tier.display_name}",
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    
     return response.data[0]
 
 @app.put("/api/admin/robux-tiers/{tier_id}", dependencies=[Depends(require_owner)])
-async def admin_update_robux_tier(tier_id: int, tier: RobuxTierCreate):
-    response = supabase.table("robux_tiers").update({
-        "robux_cost": tier.robux_cost,
-        "xcoin_amount": tier.robux_cost * settings.ROBUX_TO_XCOIN_RATE,
-        "game_pass_id": tier.game_pass_id,
-        "game_pass_url": tier.game_pass_url,
-        "display_name": tier.display_name
-    }).eq("id", tier_id).execute()
-    
-    if not response.data:
+async def admin_update_robux_tier(tier_id: int, tier: RobuxTierUpdate):
+    existing = supabase.table("robux_tiers").select("*").eq("id", tier_id).execute()
+    if not existing.data:
         raise HTTPException(404, "Tier not found")
+    
+    update_data = {}
+    if tier.robux_cost is not None:
+        if tier.robux_cost <= 0:
+            raise HTTPException(400, "Robux cost must be positive")
+        update_data["robux_cost"] = tier.robux_cost
+        
+        duplicate = supabase.table("robux_tiers").select("*").eq("robux_cost", tier.robux_cost).neq("id", tier_id).execute()
+        if duplicate.data:
+            raise HTTPException(400, f"Another tier with {tier.robux_cost} Robux already exists")
+    
+    if tier.xcoin_amount is not None:
+        if tier.xcoin_amount <= 0:
+            raise HTTPException(400, "X Coin amount must be positive")
+        update_data["xcoin_amount"] = tier.xcoin_amount
+    
+    if tier.game_pass_id is not None:
+        update_data["game_pass_id"] = tier.game_pass_id
+    
+    if tier.game_pass_url is not None:
+        update_data["game_pass_url"] = tier.game_pass_url
+    
+    if tier.display_name is not None:
+        update_data["display_name"] = tier.display_name
+    
+    if tier.is_active is not None:
+        update_data["is_active"] = tier.is_active
+    
+    if not update_data:
+        raise HTTPException(400, "No fields to update")
+    
+    response = supabase.table("robux_tiers").update(update_data).eq("id", tier_id).execute()
+    
+    supabase.table("logs").insert({
+        "action": "robux_tier_update",
+        "details": f"Updated Robux tier #{tier_id}",
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
     
     return response.data[0]
 
 @app.delete("/api/admin/robux-tiers/{tier_id}", dependencies=[Depends(require_owner)])
 async def admin_delete_robux_tier(tier_id: int):
-    supabase.table("robux_tiers").delete().eq("id", tier_id).execute()
+    supabase.table("robux_tiers").update({"is_active": False}).eq("id", tier_id).execute()
+    
+    supabase.table("logs").insert({
+        "action": "robux_tier_delete",
+        "details": f"Deleted Robux tier #{tier_id}",
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    
     return {"message": "Tier deleted"}
 
 @app.get("/api/admin/exchange-rates", dependencies=[Depends(require_owner)])
@@ -2396,9 +2437,16 @@ async def admin_update_exchange_rates(rates: ExchangeRatesUpdate):
     
     tiers = supabase.table("robux_tiers").select("*").execute()
     for tier in tiers.data:
+        new_xcoin_amount = tier["robux_cost"] * rates.robux_to_xcoin
         supabase.table("robux_tiers").update({
-            "xcoin_amount": tier["robux_cost"] * rates.robux_to_xcoin
+            "xcoin_amount": new_xcoin_amount
         }).eq("id", tier["id"]).execute()
+        
+        if tier.get("display_name") and "→" in tier["display_name"]:
+            new_display_name = tier["display_name"].split("→")[0] + f"→ {new_xcoin_amount:,} XC"
+            supabase.table("robux_tiers").update({
+                "display_name": new_display_name
+            }).eq("id", tier["id"]).execute()
     
     supabase.table("logs").insert({
         "action": "rates_update",
@@ -2406,7 +2454,7 @@ async def admin_update_exchange_rates(rates: ExchangeRatesUpdate):
         "created_at": datetime.utcnow().isoformat()
     }).execute()
     
-    return {"message": "Rates updated"}
+    return {"message": "Rates updated successfully"}
 
 @app.get("/api/admin/email-stats", dependencies=[Depends(require_owner)])
 async def admin_get_email_stats():

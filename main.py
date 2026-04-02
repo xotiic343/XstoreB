@@ -335,7 +335,7 @@ class EmailTemplates:
                     
                     <div class="footer">
                         <p>Need help? Contact us at support@xstore.com</p>
-                        <p>© 2024 XStore. All rights reserved.</p>
+                        <p>© 2026 XStore. All rights reserved.</p>
                     </div>
                 </div>
             </div>
